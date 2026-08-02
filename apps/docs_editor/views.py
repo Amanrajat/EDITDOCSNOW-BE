@@ -52,9 +52,25 @@ class DocumentUploadView(APIView):
             status=Document.Status.UPLOADED,
         )
 
-        DocumentService.update_document_metadata(
-            document
-        )
+        try:
+            DocumentService.update_document_metadata(
+                document
+            )
+        except Exception as exc:
+            document.status = Document.Status.FAILED
+            document.error_message = str(exc)
+
+            document.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                ]
+            )
+
+            return Response(
+                DocumentSerializer(document).data,
+                status=status.HTTP_201_CREATED,
+            )
 
         return Response(
             DocumentSerializer(document).data,
@@ -124,13 +140,11 @@ class SaveEditedBlocksView(APIView):
             id=document_id,
         )
 
-        updated_blocks = (
-            BlockUpdateService.update_blocks(
-                document=document,
-                blocks_data=serializer.validated_data[
-                    "blocks"
-                ],
-            )
+        BlockUpdateService.update_blocks(
+            document=document,
+            blocks_data=serializer.validated_data[
+                "blocks"
+            ],
         )
 
         filename = (
@@ -151,48 +165,56 @@ class SaveEditedBlocksView(APIView):
             exist_ok=True
         )
 
-        pdf_blocks = []
+        pdf_blocks = [
+            {
+                "page": block.page_number,
+                "text": block.text,
+                "bbox": block.bbox,
+                "font_name": block.font_name,
+                "size": block.font_size,
+                "color": block.color,
+                "is_bold": block.is_bold,
+                "is_italic": block.is_italic,
+            }
+            for block in document.blocks.all()
+        ]
 
-        for block in updated_blocks:
+        try:
+            regenerate_pdf(
+                input_path=document.original_file.path,
+                output_path=absolute_path,
+                blocks=pdf_blocks,
+            )
+        except Exception as exc:
+            document.status = Document.Status.FAILED
+            document.error_message = str(exc)
 
-            print("=" * 60)
-            print("BLOCK ID :", block.id)
-            print("FONT     :", block.font_name)
-            print("SIZE     :", block.font_size)
-            print("COLOR    :", block.color)
-            print("BOLD     :", block.is_bold)
-            print("ITALIC   :", block.is_italic)
-            print("=" * 60)
-
-            pdf_blocks.append(
-                {
-                    "page": block.page_number,
-                    "text": block.text,
-                    "new_text": block.text,
-                    "bbox": block.bbox,
-                    "font_name": block.font_name,
-                    "size": block.font_size,
-                    "color": block.color,
-                    "is_bold": block.is_bold,
-                    "is_italic": block.is_italic,
-                }
+            document.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                ]
             )
 
-        regenerate_pdf(
-            input_path=document.original_file.path,
-            output_path=absolute_path,
-            blocks=pdf_blocks,
-        )
+            return Response(
+                {
+                    "document_id": str(document.id),
+                    "error": "Failed to regenerate PDF.",
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         document.edited_file = relative_path
         document.status = (
             Document.Status.COMPLETED
         )
+        document.error_message = ""
 
         document.save(
             update_fields=[
                 "edited_file",
                 "status",
+                "error_message",
             ]
         )
 

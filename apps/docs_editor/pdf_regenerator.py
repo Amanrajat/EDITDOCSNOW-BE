@@ -56,18 +56,13 @@ def _insert_text_safely(
     color=(0, 0, 0),
     font_name="helv",
 ):
-    print("INSIDE _insert_text_safely")
     """
     Shrink font size until text fits.
     """
 
     current_size = float(font_size)
-    print("FONT SIZE RECEIVED =", current_size)
-    print("COLOR RECEIVED =", color)
 
     while current_size >= 5:
-        print("TRYING SIZE =", current_size)
-
 
         result = page.insert_textbox(
             rect,

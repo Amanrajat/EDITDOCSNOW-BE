@@ -42,11 +42,9 @@ def extract_pdf_blocks(pdf_path):
 
                 text_parts = []
 
-                font_name = ""
-                font_size = 12
-                # font_name = None
-                # font_size = None
-                # color_hex = "#000000"
+                font_name = None
+                font_size = None
+                color_hex = "#000000"
 
                 is_bold = False
                 is_italic = False
@@ -62,25 +60,14 @@ def extract_pdf_blocks(pdf_path):
 
                         text_parts.append(span_text)
 
-                        if not font_name:
-                            font_name = span.get(
-                                "font",
-                                ""
-                            )
+                        if font_name is None:
+                            font_name = span.get("font", "")
 
-                        if not font_size:
-                            font_size = span.get(
-                                "size",
-                                12
-                            )
-                        # if font_name is None:
-                        #     font_name = span.get("font", "")
+                        if font_size is None:
+                            font_size = span.get("size", 12)
 
-                        # if font_size is None:
-                        #     font_size = span.get("size", 12)
-
-                        # color_int = span.get("color", 0)
-                        # color_hex = "#{:06x}".format(color_int & 0xFFFFFF)
+                        color_int = span.get("color", 0)
+                        color_hex = "#{:06x}".format(color_int & 0xFFFFFF)
 
                         font_lower = (
                             font_name.lower()
@@ -124,12 +111,11 @@ def extract_pdf_blocks(pdf_path):
                             float(v)
                             for v in bbox
                         ],
-                        "font": font_name,
+                        "font": font_name or "",
                         "size": float(
-                            font_size
+                            font_size or 12
                         ),
-                        "color": "#000000",
-                        # "color": color_hex,
+                        "color": color_hex,
                         "bold": is_bold,
                         "italic": is_italic,
                         "has_link": has_link,
