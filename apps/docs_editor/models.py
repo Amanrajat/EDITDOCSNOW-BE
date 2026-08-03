@@ -117,6 +117,12 @@ class DocumentBlock(models.Model):
 
     text = models.TextField()
 
+    original_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="Text as originally extracted from the PDF, used to detect edited blocks",
+    )
+
     bbox = models.JSONField(
         help_text="PDF coordinates [x0, y0, x1, y1]"
     )

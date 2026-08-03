@@ -165,6 +165,10 @@ class SaveEditedBlocksView(APIView):
             exist_ok=True
         )
 
+        # Only regenerate blocks the user actually edited - every
+        # other block is left byte-for-byte untouched in the output
+        # PDF so the rest of the document keeps its original fonts,
+        # spacing, and layout.
         pdf_blocks = [
             {
                 "page": block.page_number,
@@ -177,6 +181,7 @@ class SaveEditedBlocksView(APIView):
                 "is_italic": block.is_italic,
             }
             for block in document.blocks.all()
+            if block.text != block.original_text
         ]
 
         try:

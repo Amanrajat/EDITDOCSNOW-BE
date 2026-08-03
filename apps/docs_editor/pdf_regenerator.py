@@ -1,3 +1,6 @@
+import shutil
+from collections import defaultdict
+
 import fitz
 
 
@@ -27,25 +30,49 @@ def hex_to_rgb(color_hex):
         return (0, 0, 0)
 
 
+SERIF_MARKERS = (
+    "times", "serif", "georgia", "garamond", "cambria",
+    "palatino", "minion", "cmr", "lmroman", "book",
+)
+
+MONOSPACE_MARKERS = (
+    "courier", "mono", "consolas", "menlo", "sourcecodepro",
+)
+
+
 def get_font_name(block):
     """
-    Map extracted font info to PyMuPDF fonts.
+    Best-effort map of the originally extracted font (family +
+    bold/italic flags) to the closest PyMuPDF Base-14 font.
+
+    PyMuPDF's built-in shorthand names are family-specific:
+      Helvetica: helv / heit (italic) / hebo (bold) / hebi (bold-italic)
+      Times:     tiro / tiit          / tibo         / tibi
+      Courier:   cour / coit          / cobo         / cobi
     """
 
     is_bold = block.get("is_bold", False)
     is_italic = block.get("is_italic", False)
 
+    original_font = (block.get("font_name") or "").lower()
+
+    if any(marker in original_font for marker in MONOSPACE_MARKERS):
+        family = ("cour", "coit", "cobo", "cobi")
+    elif any(marker in original_font for marker in SERIF_MARKERS):
+        family = ("tiro", "tiit", "tibo", "tibi")
+    else:
+        family = ("helv", "heit", "hebo", "hebi")
+
     if is_bold and is_italic:
-        return "helv-boldoblique"
+        return family[3]
 
     if is_bold:
-        return "helv-bold"
+        return family[2]
 
     if is_italic:
-        return "helv-oblique"
+        return family[1]
 
-    return "helv"
-
+    return family[0]
 
 
 def _insert_text_safely(
@@ -88,66 +115,90 @@ def regenerate_pdf(
     blocks,
 ):
     """
+    Re-inserts edited text into the original PDF.
+
+    `blocks` should contain ONLY the blocks whose text actually
+    changed - every other block is left completely untouched so the
+    output is visually identical to the original except where the
+    user made an edit.
+
     blocks example:
 
     [
         {
             "page": 0,
             "bbox": [...],
-            "new_text": "Updated text",
+            "text": "Updated text",
             "size": 12,
             "color": "#000000",
+            "font_name": "Times-Bold",
             "is_bold": False,
             "is_italic": False,
         }
     ]
     """
 
+    if not blocks:
+        shutil.copyfile(input_path, output_path)
+        return
+
     document = fitz.open(input_path)
 
     try:
+        blocks_by_page = defaultdict(list)
 
         for block in blocks:
+            blocks_by_page[block.get("page", 0)].append(block)
 
-            page_number = block.get("page", 0)
+        for page_number, page_blocks in blocks_by_page.items():
 
-            if page_number >= len(document):
+            if page_number < 0 or page_number >= len(document):
                 continue
 
             page = document[page_number]
+            page_bounds = page.rect
 
-            rect = fitz.Rect(block["bbox"])
+            # Pad each rect slightly so anti-aliased pixels from the
+            # original glyphs at the box edges are fully removed, and
+            # apply every redaction on the page in one pass.
+            padded_rects = []
 
-            new_text = block.get(
-                "new_text",
-                block.get("text", "")
-            )
+            for block in page_blocks:
+                rect = fitz.Rect(block["bbox"])
+                rect += (-1, -1, 1, 1)
+                rect &= page_bounds
 
-            font_size = float(
-                block.get("size", 12)
-            )
+                padded_rects.append(rect)
 
-            color = hex_to_rgb(
-                block.get("color", "#000000")
-            )
-
-            font_name = get_font_name(block)
-
-            page.add_redact_annot(
-                rect,
-                fill=(1, 1, 1)
-            )
+                page.add_redact_annot(
+                    rect,
+                    fill=(1, 1, 1),
+                )
 
             page.apply_redactions()
 
-            _insert_text_safely(
-                page=page,
-                rect=rect,
-                text=new_text,
-                font_size=font_size,
-                color=color,
-                font_name=font_name,
-            )
+            for block, rect in zip(page_blocks, padded_rects):
+
+                new_text = block.get("text", "")
+
+                font_size = float(
+                    block.get("size", 12)
+                )
+
+                color = hex_to_rgb(
+                    block.get("color", "#000000")
+                )
+
+                font_name = get_font_name(block)
+
+                _insert_text_safely(
+                    page=page,
+                    rect=rect,
+                    text=new_text,
+                    font_size=font_size,
+                    color=color,
+                    font_name=font_name,
+                )
 
         document.save(
             output_path,

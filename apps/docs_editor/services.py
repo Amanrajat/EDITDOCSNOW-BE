@@ -44,6 +44,7 @@ class BlockExtractionService:
                     document=document,
                     page_number=block["page"],
                     text=block["text"],
+                    original_text=block["text"],
                     bbox=block["bbox"],
                     font_name=block.get("font", ""),
                     font_size=block.get("size", 12),
