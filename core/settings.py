@@ -9,18 +9,28 @@ https://docs.djangoproject.com/en/6.0/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
-from pathlib import Path
-from decouple import config, Csv
+# from pathlib import Path
+# from decouple import config, Csv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
+# BASE_DIR = Path(__file__).resolve().parent.parent
+
+from pathlib import Path
+from decouple import Config, RepositoryEnv ,Csv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+config = Config(
+    RepositoryEnv(BASE_DIR / ".env")
+)
+
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config('SECRET_KEY', default='django-insecure-^)8l-v8zn6*+ny9-w3-ss5=*+sql%s5#bq4!pe_lc6lipw*che')
+# SECRET_KEY = config('SECRET_KEY', default='django-insecure-^)8l-v8zn6*+ny9-w3-ss5=*+sql%s5#bq4!pe_lc6lipw*che')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=True, cast=bool)
