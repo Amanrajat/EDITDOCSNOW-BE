@@ -1,8 +1,11 @@
+import importlib
 import os
 import tempfile
 
 import fitz
-from django.test import TestCase
+from django.conf import settings as dj_settings
+from django.test import TestCase, override_settings
+from django.urls import clear_url_caches, resolve
 
 from .pdf_regenerator import regenerate_pdf, get_font_spec
 
@@ -285,3 +288,138 @@ class RegeneratePdfTextIntegrityTests(TestCase):
                         )
             finally:
                 result.close()
+
+
+class RealisticTwoColumnResumeRegressionTests(TestCase):
+    """
+    Full-page regression using the exact two-column resume layout reported
+    as producing overlapping characters: a wide left column (EXPERIENCE /
+    EDUCATION, bold sans headings with an em dash, serif body text, mixed
+    font sizes) next to a narrow right column (SKILLS / AWARDS) that forces
+    text wrapping. Every block on the page is edited and regenerated
+    together, exactly as happens when a user fills out every field of a
+    resume template in one save.
+    """
+
+    def test_two_column_resume_layout_no_overlap_or_corruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.pdf")
+            out = os.path.join(tmp, "out.pdf")
+
+            doc = fitz.open()
+            page = doc.new_page(width=612, height=792)
+
+            # Left column - sans bold headings, serif body, an em dash, and
+            # more than one font size.
+            # Plain hyphens here, not em dashes: PyMuPDF's own Base-14
+            # "simple font" encoding (used only to fabricate this test's
+            # source PDF) can't represent U+2014 either, which would corrupt
+            # the *source* text and defeat the point of this test. The em
+            # dash is introduced below, in the user's edit - that's the
+            # actual code path (our Liberation-font reinsertion) under test.
+            left = [
+                (60, "EXPERIENCE", 12, "hebo"),
+                (84, "Company, Location - Job Title", 13, "hebo"),
+                (102, "MONTH 20XX - PRESENT", 9, "helv"),
+                (120, "Lorem ipsum dolor sit amet, consectetuer adipiscing elit, sed diam nonummy.", 10, "tiro"),
+                (160, "EDUCATION", 12, "hebo"),
+                (184, "School Name, Location - Degree", 13, "hebo"),
+                (202, "MONTH 20XX - MONTH 20XX", 9, "helv"),
+                (220, "Sed diam nonummy nibh euismod tincidunt ut laoreet dolore magna aliquam.", 10, "tiro"),
+            ]
+            for y, text, size, font in left:
+                page.insert_text(fitz.Point(50, y), text, fontsize=size, fontname=font)
+
+            # Right column - deliberately narrow, forcing our shrink-to-fit /
+            # wrap logic to actually kick in.
+            right = [
+                (60, "SKILLS", 12, "hebo"),
+                (78, "Python, Django, PostgreSQL, PyMuPDF, Docker.", 9, "helv"),
+                (140, "AWARDS", 12, "hebo"),
+                (158, "Lorem ipsum dolor sit amet consectetuer adipiscing elit sed diam.", 9, "helv"),
+            ]
+            for y, text, size, font in right:
+                page.insert_text(fitz.Point(430, y), text, fontsize=size, fontname=font)
+
+            doc.save(src)
+            doc.close()
+
+            from .pdf_extractor import extract_pdf_blocks
+            extracted = extract_pdf_blocks(src)
+            self.assertGreater(len(extracted), 0, "extractor found no blocks on the resume page")
+
+            edits = {
+                "Company, Location - Job Title": "WhatBytes, Location — Backend Engineer",
+                "School Name, Location - Degree": "IIT Bombay, Mumbai — B.Tech CSE",
+            }
+            blocks = []
+            for b in extracted:
+                bbox_width = b["bbox"][2] - b["bbox"][0]
+                blocks.append({
+                    "page": b["page"],
+                    # Right-column blocks are narrow by construction; keep
+                    # that constraint intact instead of widening it, so this
+                    # test actually exercises the narrow-column wrap path.
+                    "bbox": b["bbox"] if b["bbox"][0] < 400 else [
+                        b["bbox"][0], b["bbox"][1], b["bbox"][0] + max(bbox_width, 130), b["bbox"][3] + 20,
+                    ],
+                    "text": edits.get(b["text"], b["text"]),
+                    "size": b["size"],
+                    "color": b["color"],
+                    "font_name": b["font"],
+                    "is_bold": b["bold"],
+                    "is_italic": b["italic"],
+                })
+
+            regenerate_pdf(src, out, blocks)
+
+            result = fitz.open(out)
+            try:
+                page_text = result[0].get_text()
+                self.assertNotIn("�", page_text)
+                self.assertIn("WhatBytes, Location — Backend Engineer", page_text)
+                self.assertIn("IIT Bombay, Mumbai — B.Tech CSE", page_text)
+                self.assertIn("SKILLS", page_text)
+                self.assertIn("AWARDS", page_text)
+
+                chars = _char_positions(result)
+                by_line = {}
+                for ch in chars:
+                    key = round(ch["origin"][1], 1)
+                    by_line.setdefault(key, []).append(ch)
+                for _, line_chars in by_line.items():
+                    line_chars.sort(key=lambda c: c["origin"][0])
+                    for prev, cur in zip(line_chars, line_chars[1:]):
+                        self.assertGreaterEqual(
+                            round(cur["bbox"][0], 2), round(prev["bbox"][2], 2) - 0.05,
+                            f"glyph {cur['c']!r} overlaps {prev['c']!r} in two-column resume layout",
+                        )
+            finally:
+                result.close()
+
+
+class MediaServingRegressionTests(TestCase):
+    """
+    core/urls.py must serve /media/... in every environment, including
+    DEBUG=False (Render, and this project's Docker image, both run with
+    DEBUG=False). django.conf.urls.static.static() looks like it does this
+    but silently returns an empty urlpatterns list whenever DEBUG=False -
+    that's a guard built into Django itself - which made every edited-PDF
+    download 404 in production while working fine locally under DEBUG=True.
+    core/urls.py now registers the `serve` view directly to bypass that
+    guard; this test reloads the urlconf with DEBUG forced off and asserts
+    the media route still resolves.
+    """
+
+    def test_media_url_resolves_when_debug_is_false(self):
+        import core.urls as core_urls
+
+        with override_settings(DEBUG=False):
+            importlib.reload(core_urls)
+            clear_url_caches()
+            try:
+                match = resolve(f"{dj_settings.MEDIA_URL}documents/edited/example.pdf")
+                self.assertIn("serve", match.func.__name__)
+            finally:
+                importlib.reload(core_urls)
+                clear_url_caches()
