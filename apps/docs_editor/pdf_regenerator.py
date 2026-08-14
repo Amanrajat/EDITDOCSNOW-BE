@@ -93,6 +93,44 @@ def get_font_spec(block):
     return fontname, fontfile
 
 
+# Default assumed page margin (points) used to cap how far a block's
+# insertion box may grow past its original right edge. 0.5in is a common
+# document margin; it's a page-level fallback, not derived from any
+# particular block's text, so it applies the same way to any edited block.
+_PAGE_RIGHT_MARGIN = 36.0
+
+
+def _widen_rect_to_fit_single_line(rect, page_bounds, text, font_size, font_file):
+    """
+    A block's extracted bbox is exactly as wide as its ORIGINAL text at its
+    original font size. Editing that text to something longer (e.g.
+    "PROJECTS" -> "PROJECTS AMAN") doesn't mean it no longer fits anywhere -
+    it just no longer fits in that exact box. Before ever shrinking the font,
+    grow the box's right edge (x0/y0/y1 - position and baseline - are left
+    untouched) far enough to fit the new text on one line at the ORIGINAL
+    font size, capped at a safe page margin so it never runs off the page.
+
+    Returns `rect` unchanged if the text already fits, or if font_file is
+    unavailable to measure against.
+    """
+
+    if not font_file:
+        return rect
+
+    needed_width = fitz.Font(fontfile=font_file).text_length(text, fontsize=font_size)
+
+    if needed_width <= rect.width:
+        return rect
+
+    max_x1 = max(page_bounds.x1 - _PAGE_RIGHT_MARGIN, rect.x1)
+    grown_x1 = min(rect.x0 + needed_width, max_x1)
+
+    if grown_x1 <= rect.x1:
+        return rect
+
+    return fitz.Rect(rect.x0, rect.y0, grown_x1, rect.y1)
+
+
 def _insert_text_safely(
     page,
     rect,
@@ -103,7 +141,9 @@ def _insert_text_safely(
     font_file=None,
 ):
     """
-    Shrink font size until text fits.
+    Insert at the original font size first; only shrink it, in small steps,
+    if the text genuinely doesn't fit even after _widen_rect_to_fit_single_line
+    has given it all the room the page can safely offer.
     """
 
     current_size = float(font_size)
@@ -211,9 +251,13 @@ def regenerate_pdf(
 
                 font_name, font_file = get_font_spec(block)
 
+                insertion_rect = _widen_rect_to_fit_single_line(
+                    rect, page_bounds, new_text, font_size, font_file,
+                )
+
                 _insert_text_safely(
                     page=page,
-                    rect=rect,
+                    rect=insertion_rect,
                     text=new_text,
                     font_size=font_size,
                     color=color,

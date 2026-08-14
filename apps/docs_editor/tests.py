@@ -91,6 +91,43 @@ def _char_positions(doc, page_index=0):
     return chars
 
 
+def _regenerate_heading_edit(original_text, edited_text, font="hebo", size=14):
+    """
+    Build a source PDF containing ONLY `original_text`, extract it exactly
+    as a real upload would (bbox tight around the original text, at its
+    original font/size), then regenerate it with the text changed to
+    `edited_text` - same as a user editing just the text of that block.
+
+    Returns (output_doc, original_extracted_block) so callers can assert the
+    regenerated span still matches the original block's size/font/position.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src.pdf")
+        out = os.path.join(tmp, "out.pdf")
+
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=150)
+        page.insert_text(fitz.Point(50, 60), original_text, fontsize=size, fontname=font)
+        doc.save(src)
+        doc.close()
+
+        from .pdf_extractor import extract_pdf_blocks
+        extracted = extract_pdf_blocks(src)
+        original = extracted[0]
+
+        block = {
+            "page": original["page"], "bbox": original["bbox"], "text": edited_text,
+            "size": original["size"], "color": original["color"], "font_name": original["font"],
+            "is_bold": original["bold"], "is_italic": original["italic"],
+        }
+        regenerate_pdf(src, out, [block])
+
+        result = fitz.open(out)
+        data = result.tobytes()
+        result.close()
+        return fitz.open(stream=data, filetype="pdf"), original
+
+
 class RegeneratePdfTextIntegrityTests(TestCase):
     """
     Regression tests for the font-substitution pipeline in pdf_regenerator.py.
@@ -288,6 +325,120 @@ class RegeneratePdfTextIntegrityTests(TestCase):
                         )
             finally:
                 result.close()
+
+
+class PreservesOriginalFormattingWhenOnlyTextChangesTests(TestCase):
+    """
+    Editing a block's text must never change its font size, font family,
+    weight/style, color, or position - only the text content. Regression
+    for: editing "PROJECTS" -> "PROJECTS AMAN" rendered visibly smaller than
+    the original heading, because the block's bbox (tight around the
+    original, shorter text) was reused as-is and the shrink-to-fit fallback
+    in _insert_text_safely kicked in the moment the longer text didn't fit
+    that exact box.
+    """
+
+    def _assert_formatting_preserved(self, original_text, edited_text, font="hebo", size=14):
+        doc, original = _regenerate_heading_edit(original_text, edited_text, font=font, size=size)
+        try:
+            page_text = doc[0].get_text().strip()
+            self.assertEqual(page_text, edited_text)
+
+            chars = _char_positions(doc)
+            self.assertTrue(chars, "no glyphs were extracted from the regenerated PDF")
+
+            expected_fontname, _ = get_font_spec({
+                "font_name": original["font"],
+                "is_bold": original["bold"],
+                "is_italic": original["italic"],
+            })
+
+            for ch in chars:
+                # font size - the ORIGINAL block's size, never recalculated
+                # from the new (possibly longer or shorter) text.
+                self.assertEqual(
+                    ch["size"], original["size"],
+                    f"font size changed from {original['size']} to {ch['size']} "
+                    f"after editing {original_text!r} -> {edited_text!r}",
+                )
+                # font family + bold/italic style, mapped the same way
+                # get_font_spec() would map the original block.
+                self.assertEqual(ch["font"], expected_fontname)
+
+            # position: left edge and baseline stay where the original text
+            # was (the 1pt tolerance accounts for the anti-alias padding
+            # applied to the redaction/insertion rect, not a formatting
+            # change).
+            first = chars[0]
+            self.assertLess(abs(first["origin"][0] - original["bbox"][0]), 2.0)
+            self.assertLess(abs(first["bbox"][1] - original["bbox"][1]), 2.0)
+
+            # no glyph overlap anywhere on the (single) line.
+            prev = None
+            for ch in chars:
+                if prev is not None and abs(ch["origin"][1] - prev["origin"][1]) < 0.1:
+                    self.assertGreaterEqual(
+                        round(ch["bbox"][0], 2), round(prev["bbox"][2], 2) - 0.05,
+                        f"glyph {ch['c']!r} overlaps preceding glyph {prev['c']!r} "
+                        f"after editing {original_text!r} -> {edited_text!r}",
+                    )
+                prev = ch
+
+            return doc, chars
+        finally:
+            doc.close()
+
+    def test_projects_heading_extended_with_a_word(self):
+        self._assert_formatting_preserved("PROJECTS", "PROJECTS AMAN")
+
+    def test_company_extended_with_a_word(self):
+        self._assert_formatting_preserved("Company", "Company ABC")
+
+    def test_school_name_extended_with_a_word(self):
+        self._assert_formatting_preserved("School Name", "School Name XYZ")
+
+    def test_short_text_extended_to_longer_text(self):
+        self._assert_formatting_preserved("Skills", "Skills & Technologies")
+
+    def test_long_text_shortened(self):
+        self._assert_formatting_preserved(
+            "Senior Backend Engineer and Team Lead", "Backend Engineer"
+        )
+
+    def test_extremely_long_replacement_falls_back_to_minimal_shrink(self):
+        """
+        When the edited text genuinely cannot fit even after widening the
+        insertion box to the page's safe margin, a controlled fallback must
+        still apply: shrink the font (never compress/overlap characters),
+        keep the same font family/style, and never wipe the text.
+        """
+        original_text, edited_text = "Skills", "Skills: Python, Django, PostgreSQL, Docker, React, AWS, Kubernetes"
+        doc, original = _regenerate_heading_edit(original_text, edited_text, font="hebo", size=14)
+        try:
+            page_text = doc[0].get_text().strip()
+            self.assertIn(edited_text, page_text)
+
+            chars = _char_positions(doc)
+            self.assertTrue(chars)
+
+            expected_fontname, _ = get_font_spec({
+                "font_name": original["font"], "is_bold": original["bold"], "is_italic": original["italic"],
+            })
+            sizes = {ch["size"] for ch in chars}
+            self.assertEqual(len(sizes), 1, "font size must stay consistent across the whole fallback run")
+            fallback_size = sizes.pop()
+            self.assertLessEqual(fallback_size, original["size"])
+            self.assertGreaterEqual(fallback_size, 5.0)
+            for ch in chars:
+                self.assertEqual(ch["font"], expected_fontname)
+
+            prev = None
+            for ch in chars:
+                if prev is not None and abs(ch["origin"][1] - prev["origin"][1]) < 0.1:
+                    self.assertGreaterEqual(round(ch["bbox"][0], 2), round(prev["bbox"][2], 2) - 0.05)
+                prev = ch
+        finally:
+            doc.close()
 
 
 class RealisticTwoColumnResumeRegressionTests(TestCase):
