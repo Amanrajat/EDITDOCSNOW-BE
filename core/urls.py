@@ -13,8 +13,10 @@ urlpatterns = [
     ),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(
-        settings.MEDIA_URL,
-        document_root=settings.MEDIA_ROOT
-    )
+# Static files are served by whitenoise regardless of DEBUG. Media (uploaded/
+# generated PDFs) has no object storage configured, so Django serves it
+# directly in every environment — fine for this app's traffic level.
+urlpatterns += static(
+    settings.MEDIA_URL,
+    document_root=settings.MEDIA_ROOT
+)

@@ -49,6 +49,39 @@ python manage.py runserver
 The API is served under `/docs_editor/`, uploaded/generated files under `/media/`
 (only served by Django itself when `DEBUG=True`).
 
+## Docker
+
+```bash
+docker build -t editdocsnow-be .
+docker run -p 8000:8000 \
+  -e SECRET_KEY=change-me \
+  -e DEBUG=False \
+  -e ALLOWED_HOSTS=localhost \
+  -e DATABASE_URL=postgres://user:password@host:5432/dbname \
+  editdocsnow-be
+```
+
+The container's `entrypoint.sh` runs `migrate`, then `collectstatic`, then starts
+`gunicorn`. It accepts either a single `DATABASE_URL` or the discrete `DB_*`
+vars from `.env.example`.
+
+## Deploy to Render
+
+`render.yaml` is a Blueprint that provisions a free web service (built from
+the `Dockerfile`) and a free managed Postgres database, wired together via
+`DATABASE_URL`.
+
+1. Push this repo to GitHub/GitLab.
+2. In the Render dashboard: **New > Blueprint**, point it at the repo.
+3. Render creates `editdocsnow-be` (web) and `editdocsnow-db` (Postgres) and
+   generates `SECRET_KEY` automatically.
+
+Known limitation: no object storage (S3, etc.) is configured, so uploaded and
+generated PDFs live on the web service's local disk under `/app/media`. The
+free plan has no persistent disk, so **files are lost on every deploy/restart**.
+For real usage, either upgrade to a paid instance and uncomment the `disk:`
+block in `render.yaml`, or swap `MEDIA` storage for `django-storages` + S3.
+
 ## API reference
 
 Base URL: `http://localhost:8000/docs_editor/`
