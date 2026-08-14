@@ -221,10 +221,6 @@ def regenerate_pdf(
                     font_file=font_file,
                 )
 
-        # Embedding full Liberation font files (get_font_spec) adds a few
-        # hundred KB per font; trim each to only the glyphs actually used.
-        document.subset_fonts()
-
         document.save(
             output_path,
             garbage=4,
