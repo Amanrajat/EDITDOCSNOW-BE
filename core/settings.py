@@ -57,7 +57,11 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'corsheaders',
-    'apps.docs_editor'
+    'apps.docs_editor',
+    'apps.pdf_merge',
+    'apps.pdf_split',
+    'apps.pdf_organize',
+    'apps.pdf_remove_pages',
 ]
 
 MIDDLEWARE = [
