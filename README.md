@@ -15,6 +15,9 @@ frontend edit them, and regenerating a new PDF with the edits applied.
 
 ```
 core/                   Django project (settings, root URLs)
+apps/common/            Shared helpers reused across PDF-processing apps
+  validation.py         PDF upload validation (size, extension, magic bytes, corruption, page count)
+  responses.py          Consistent {success, message, data|error_code} API envelope
 apps/docs_editor/
   models.py             Document, DocumentBlock
   views.py              API views (upload, detail, extract, save)
@@ -23,6 +26,22 @@ apps/docs_editor/
   pdf_extractor.py       PDF -> text block extraction (PyMuPDF)
   pdf_regenerator.py     Blocks -> edited PDF (redact + reinsert text)
   urls.py               App routes, mounted at /docs_editor/
+apps/pdf_merge/         Merge PDF feature, mounted at /api/v1/pdf/
+  models.py             MergeJob (result tracking, UUID-addressable)
+  services.py           MergePDFService (PyMuPDF insert_pdf, page-order control)
+  management/commands/cleanup_merge_jobs.py   Deletes MergeJob rows + files older than --days
+apps/pdf_split/         Split PDF feature, mounted at /api/v1/pdf/
+  models.py             SplitJob
+  services.py           SplitPDFService (all_pages/ranges/every_n/extract modes, ZIP packaging)
+  management/commands/cleanup_split_jobs.py   Deletes SplitJob rows + files older than --days
+apps/pdf_organize/      Organize PDF feature, mounted at /api/v1/pdf/
+  models.py             OrganizeJob
+  services.py           OrganizePDFService + validate_order() (1-based page-order validation)
+  management/commands/cleanup_organize_jobs.py   Deletes OrganizeJob rows + files older than --days
+apps/pdf_remove_pages/  Remove Pages feature, mounted at /api/v1/pdf/
+  models.py             RemovePagesJob
+  services.py           RemovePagesService + validate_pages_to_remove() (rejects removing every page)
+  management/commands/cleanup_remove_pages_jobs.py   Deletes RemovePagesJob rows + files older than --days
 ```
 
 ## Setup
@@ -177,6 +196,257 @@ Response `200`:
 
 On regeneration failure, `status` is `500` and the document's `status`/`error_message`
 are updated to `"failed"`.
+
+### 5. Merge PDF
+
+```
+POST /api/v1/pdf/merge/
+Content-Type: multipart/form-data
+Authentication: none required (same as every other endpoint today)
+
+Body:
+  files: 2+ PDF files, sent as repeated "files" fields
+  order: optional, 0-based permutation of the files' indices
+         (e.g. [2, 0, 1]) - lets a client reorder without re-uploading;
+         defaults to upload order when omitted
+```
+
+Validation: 2-20 files, each individually a real, non-corrupted, non-encrypted
+PDF under 50 MB (extension + magic-byte + PyMuPDF-open checks - not just a
+trusted `Content-Type` header), combined size under 150 MB, combined page
+count under 3000.
+
+Response `201`:
+```json
+{
+  "success": true,
+  "message": "PDFs merged successfully",
+  "data": {
+    "file_id": "a846ca76-6590-41e2-ae58-11f52b5a27b7",
+    "owner_token": "6jmlbcinruPaAwdW0ByaBLu_9RBpLAGKGSTJDIGJxbM",
+    "download_url": "http://localhost:8000/api/v1/pdf/merge/a846ca76-.../download/?token=6jmlbc...",
+    "filename": "merged.pdf",
+    "source_count": 2,
+    "total_pages": 3
+  }
+}
+```
+
+`download_url` already has the token embedded - see [Ownership & access control](#ownership--access-control)
+below for what enforces it and why.
+
+Error response (validation failure, `400`, or processing failure, `500`):
+```json
+{
+  "success": false,
+  "message": "Invalid request.",
+  "error_code": "VALIDATION_ERROR",
+  "errors": { "files": ["At least 2 PDF files are required to merge."] }
+}
+```
+
+Merge results (`MergeJob` rows + their output files) are not deleted
+automatically - run `python manage.py cleanup_merge_jobs --days 7` on a
+schedule (cron / Render cron job) to purge old ones, since there is no
+background task runner in this project yet.
+
+### 6. Split PDF
+
+```
+POST /api/v1/pdf/split/
+Content-Type: multipart/form-data
+Authentication: none required (same as every other endpoint today)
+
+Body:
+  file:   a single PDF
+  mode:   "all_pages" | "ranges" | "every_n" | "extract"
+  ranges: required for mode=ranges, e.g. "1-5,6-10,11"
+          (commas and/or newlines as separators)
+  n:      required for mode=every_n - split into consecutive chunks of
+          n pages each (the last chunk may be shorter)
+  pages:  required for mode=extract - repeated field, e.g.
+          pages=3&pages=1&pages=4 - 1-based page numbers, combined into
+          ONE output PDF in the exact order given (duplicates allowed)
+```
+
+**Overlapping/duplicate ranges rule** (mode=ranges): ranges are **not**
+deduplicated, sorted, or merged. Each range produces exactly one output
+file, in input order - `"1-3,2-5"` produces two files, and pages 2-3
+simply appear in both. A reversed range (`"5-2"`) or any page outside
+`1..total_pages` is rejected with a `400`.
+
+If the operation produces exactly one output file (e.g. `extract`, or
+`ranges`/`every_n` reducing to a single chunk), the response is a single
+PDF. Otherwise the outputs are zipped.
+
+Response `201` (multiple outputs):
+```json
+{
+  "success": true,
+  "message": "PDF split successfully",
+  "data": {
+    "file_id": "5ba6bee8-c574-4229-a3ff-2bbf16ed2b5e",
+    "owner_token": "Zk3f...",
+    "download_url": "http://localhost:8000/api/v1/pdf/split/5ba6bee8-.../download/?token=Zk3f...",
+    "filename": "split_result.zip",
+    "is_zip": true,
+    "output_count": 3,
+    "output_filenames": ["pages_1-3.pdf", "pages_4-5.pdf", "pages_6-7.pdf"],
+    "source_pages": 7
+  }
+}
+```
+
+Error response (`400` validation, or `500` processing failure) follows the
+same `{success, message, error_code, errors}` shape as Merge PDF.
+
+Run `python manage.py cleanup_split_jobs --days 7` on a schedule to purge
+old `SplitJob` rows and their output files.
+
+### 7. Organize PDF
+
+```
+POST /api/v1/pdf/organize/
+Content-Type: multipart/form-data
+Authentication: none required (same as every other endpoint today)
+
+Body:
+  file:  a single PDF
+  order: the full new page order, 1-based (page 1 is what a user sees as
+         "page 1" - the API is 1-based, not 0-based, to match that),
+         sent as repeated multipart fields - e.g. for a 5-page document
+         reordered to [3,1,5,2,4]:
+         order=3&order=1&order=5&order=2&order=4
+         (the same repeated-field convention Merge's `order` and Split's
+         `pages` already use)
+```
+
+**Validation is strict, not best-effort**: `order` must be a genuine
+permutation of `1..page_count` - exactly `page_count` values, no
+duplicates, no page skipped, nothing out of range, no non-integers
+(including `true`/`false`, which Python's `bool` would otherwise pass as
+`int`). Any violation is rejected with a specific message identifying
+which pages were duplicated/missing/out-of-range - the backend never
+silently drops, dedupes, or reorders around a bad request.
+
+Response `201`:
+```json
+{
+  "success": true,
+  "message": "PDF organized successfully",
+  "data": {
+    "file_id": "b2f6e6b0-...",
+    "owner_token": "Kx9f...",
+    "download_url": "http://localhost:8000/api/v1/pdf/organize/b2f6e6b0-.../download/?token=Kx9f...",
+    "filename": "organized.pdf",
+    "page_count": 5
+  }
+}
+```
+
+Error response (`400` validation, or `500` processing failure) follows the
+same `{success, message, error_code, errors}` shape as Merge/Split PDF.
+
+Run `python manage.py cleanup_organize_jobs --days 7` on a schedule to purge
+old `OrganizeJob` rows and their output files.
+
+### 8. Remove Pages
+
+```
+POST /api/v1/pdf/remove-pages/
+Content-Type: multipart/form-data
+Authentication: none required (same as every other endpoint today)
+
+Body:
+  file:  a single PDF
+  pages: 1-based page numbers to delete, sent as repeated multipart
+         fields - e.g. to remove pages 2 and 4: pages=2&pages=4
+         (the same repeated-field convention Merge/Split/Organize use)
+```
+
+**Validation**: every page number must be in range and not repeated, and
+the request is rejected if it would remove every page - the resulting PDF
+would be empty, which this feature does not support. Remaining pages keep
+their original relative order; removal never reorders anything.
+
+Response `201`:
+```json
+{
+  "success": true,
+  "message": "Pages removed successfully",
+  "data": {
+    "file_id": "9d1c...",
+    "owner_token": "Rm2p...",
+    "download_url": "http://localhost:8000/api/v1/pdf/remove-pages/9d1c-.../download/?token=Rm2p...",
+    "filename": "pages_removed.pdf",
+    "source_page_count": 5,
+    "removed_pages": [2, 4],
+    "output_page_count": 3
+  }
+}
+```
+
+Error response (`400` validation, or `500` processing failure) follows the
+same `{success, message, error_code, errors}` shape as the other features.
+
+Run `python manage.py cleanup_remove_pages_jobs --days 7` on a schedule to
+purge old `RemovePagesJob` rows and their output files.
+
+## Ownership & access control
+
+**Architectural decision, not an oversight**: this product has no user
+accounts, login, or session system today - no registration/login page
+exists anywhere in the frontend, and the backend has no auth endpoints
+beyond Django's own `/admin/`. Bolting on a full login flow just to gate
+file access would be a much bigger, unasked-for product decision (a login
+UI, password reset, email verification, ...), so this deliberately does
+**not** do that.
+
+**What's actually enforced instead** (`apps/common/ownership.py`,
+`apps/common/views.py`, reused by every job-based feature): every job
+(`MergeJob`, `SplitJob`, and anything built the same way going forward)
+issues a random 32-byte bearer token at creation time, returned once in
+that creation response (`data.owner_token`, and already embedded as
+`?token=...` in `data.download_url`). Whoever holds that exact token can
+view/download that one job's result; nobody else can - including another
+anonymous visitor who happens to see or guess the job's UUID. The token
+is checked with a constant-time comparison (`secrets.compare_digest`).
+
+This closes a real gap: previously, a job's UUID alone - routinely visible
+in URLs and API responses - was sufficient to download **any** job's
+output, from any client, no secret required. A bearer token is a strict
+improvement over that with zero login friction, and needs no changes when
+real user accounts are eventually added: `job.user` (already a nullable FK
+on every job model) is checked first and wins whenever the requester is
+authenticated as that job's owner; the token remains as the fallback that
+makes anonymous jobs private too.
+
+**Where the file actually lives**: job output files are stored under
+`private_media/` (a `FileSystemStorage` instance pointed outside
+`MEDIA_ROOT` - see `apps/common/storage.py`), which no URL pattern in
+`core/urls.py` serves. The *only* way to retrieve one is through the
+per-feature `.../download/` endpoint, which checks ownership before
+streaming the file - unlike `/media/...`, there's no raw path that bypasses
+the token.
+
+**Non-existence vs. wrong token**: both return an identical `404` with
+`error_code: "NOT_FOUND"`. Confirming "this id exists, you just have the
+wrong token" would let an attacker enumerate valid job ids even without
+ever accessing their contents, so the two cases are indistinguishable by
+design.
+
+**Unauthenticated policy, explicitly**: every endpoint remains fully usable
+without logging in (consistent with the rest of this product) - "access
+control" here means *per-job* privacy via the token, not *login-gating*
+the feature itself. A request with no token and no matching authenticated
+user is simply treated as "not this job's owner."
+
+**Known, deliberate scope boundary**: this layer is not retrofitted onto
+`apps.docs_editor` (the original PDF text editor) in this pass - that
+endpoint's access model (any UUID holder can view/edit/extract) is
+unchanged, to avoid risk to an already-shipped, already-tested feature as
+a side effect of unrelated work. If/when that's worth closing, it should
+be its own deliberate change against `apps/docs_editor` specifically.
 
 ## Frontend integration
 

@@ -13,6 +13,13 @@ urlpatterns = [
         'docs_editor/',
         include('apps.docs_editor.urls')
     ),
+
+    # New PDF-processing features are mounted under a versioned prefix,
+    # separate from the pre-existing /docs_editor/ routes above.
+    path('api/v1/pdf/', include('apps.pdf_merge.urls')),
+    path('api/v1/pdf/', include('apps.pdf_split.urls')),
+    path('api/v1/pdf/', include('apps.pdf_organize.urls')),
+    path('api/v1/pdf/', include('apps.pdf_remove_pages.urls')),
 ]
 
 # Static files are served by whitenoise regardless of DEBUG. Media (uploaded/
