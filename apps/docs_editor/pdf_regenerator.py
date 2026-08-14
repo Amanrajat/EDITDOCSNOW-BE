@@ -1,3 +1,4 @@
+import os
 import shutil
 from collections import defaultdict
 
@@ -39,16 +40,38 @@ MONOSPACE_MARKERS = (
     "courier", "mono", "consolas", "menlo", "sourcecodepro",
 )
 
+FONTS_DIR = os.path.join(os.path.dirname(__file__), "fonts")
 
-def get_font_name(block):
+# Liberation fonts are metric-compatible replacements for Helvetica/Times/
+# Courier and, unlike PyMuPDF's Base-14 names, are embedded as real font
+# files with full Unicode coverage (em-dash, en-dash, bullets, curly
+# quotes, ligatures, ...). Base-14 names insert text as an 8-bit "simple"
+# font, which silently replaces any character above U+00FF with "?" when
+# PyMuPDF writes the content stream - that's what caused the corruption.
+_FONT_FILES = {
+    ("sans", False, False): "LiberationSans-Regular.ttf",
+    ("sans", True, False): "LiberationSans-Bold.ttf",
+    ("sans", False, True): "LiberationSans-Italic.ttf",
+    ("sans", True, True): "LiberationSans-BoldItalic.ttf",
+    ("serif", False, False): "LiberationSerif-Regular.ttf",
+    ("serif", True, False): "LiberationSerif-Bold.ttf",
+    ("serif", False, True): "LiberationSerif-Italic.ttf",
+    ("serif", True, True): "LiberationSerif-BoldItalic.ttf",
+    ("mono", False, False): "LiberationMono-Regular.ttf",
+    ("mono", True, False): "LiberationMono-Bold.ttf",
+    ("mono", False, True): "LiberationMono-Italic.ttf",
+    ("mono", True, True): "LiberationMono-BoldItalic.ttf",
+}
+
+
+def get_font_spec(block):
     """
     Best-effort map of the originally extracted font (family +
-    bold/italic flags) to the closest PyMuPDF Base-14 font.
+    bold/italic flags) to a bundled Unicode-capable replacement.
 
-    PyMuPDF's built-in shorthand names are family-specific:
-      Helvetica: helv / heit (italic) / hebo (bold) / hebi (bold-italic)
-      Times:     tiro / tiit          / tibo         / tibi
-      Courier:   cour / coit          / cobo         / cobi
+    Returns (fontname_alias, fontfile_path). `fontname_alias` must be
+    unique per distinct font file so PyMuPDF embeds it once per
+    document and reuses it on every subsequent insert_textbox() call.
     """
 
     is_bold = block.get("is_bold", False)
@@ -57,22 +80,17 @@ def get_font_name(block):
     original_font = (block.get("font_name") or "").lower()
 
     if any(marker in original_font for marker in MONOSPACE_MARKERS):
-        family = ("cour", "coit", "cobo", "cobi")
+        family = "mono"
     elif any(marker in original_font for marker in SERIF_MARKERS):
-        family = ("tiro", "tiit", "tibo", "tibi")
+        family = "serif"
     else:
-        family = ("helv", "heit", "hebo", "hebi")
+        family = "sans"
 
-    if is_bold and is_italic:
-        return family[3]
+    file_name = _FONT_FILES[(family, bool(is_bold), bool(is_italic))]
+    fontname = os.path.splitext(file_name)[0]
+    fontfile = os.path.join(FONTS_DIR, file_name)
 
-    if is_bold:
-        return family[2]
-
-    if is_italic:
-        return family[1]
-
-    return family[0]
+    return fontname, fontfile
 
 
 def _insert_text_safely(
@@ -82,6 +100,7 @@ def _insert_text_safely(
     font_size=12,
     color=(0, 0, 0),
     font_name="helv",
+    font_file=None,
 ):
     """
     Shrink font size until text fits.
@@ -96,6 +115,7 @@ def _insert_text_safely(
             text,
             fontsize=current_size,
             fontname=font_name,
+            fontfile=font_file,
             color=color,
             align=0,
             overlay=True,
@@ -189,7 +209,7 @@ def regenerate_pdf(
                     block.get("color", "#000000")
                 )
 
-                font_name = get_font_name(block)
+                font_name, font_file = get_font_spec(block)
 
                 _insert_text_safely(
                     page=page,
@@ -198,7 +218,12 @@ def regenerate_pdf(
                     font_size=font_size,
                     color=color,
                     font_name=font_name,
+                    font_file=font_file,
                 )
+
+        # Embedding full Liberation font files (get_font_spec) adds a few
+        # hundred KB per font; trim each to only the glyphs actually used.
+        document.subset_fonts()
 
         document.save(
             output_path,
