@@ -574,3 +574,410 @@ class MediaServingRegressionTests(TestCase):
             finally:
                 importlib.reload(core_urls)
                 clear_url_caches()
+
+
+import json
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from PIL import Image
+import io as _io
+
+from .models import Document, DocumentObject
+
+
+def _make_pdf_bytes(page_texts, page_size=(595, 842)):
+    doc = fitz.open()
+    for text in page_texts:
+        page = doc.new_page(width=page_size[0], height=page_size[1])
+        page.insert_text(fitz.Point(72, 80), text, fontsize=14)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def _make_png_bytes(size=(80, 60), color=(200, 30, 30)):
+    buffer = _io.BytesIO()
+    Image.new("RGB", size, color=color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class DocumentOwnershipTests(TestCase):
+    """
+    Access-control regression suite for the shared ownership layer, now
+    that docs_editor enforces it (it didn't before - see the model/view
+    docstrings). Same conventions as every other feature's ownership
+    tests: identical 404 for wrong-owner and non-existent, malformed IDs
+    handled safely, raw media path never serves the private edited_file.
+    """
+
+    def _upload(self):
+        pdf = SimpleUploadedFile("doc.pdf", _make_pdf_bytes(["Hello"]), content_type="application/pdf")
+        response = self.client.post("/docs_editor/upload/", {"original_file": pdf})
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        return body["id"], body["owner_token"]
+
+    def test_owner_can_view_extract_and_save(self):
+        document_id, token = self._upload()
+
+        detail = self.client.get(f"/docs_editor/{document_id}/?token={token}")
+        self.assertEqual(detail.status_code, 200)
+
+        extract = self.client.post(f"/docs_editor/{document_id}/extract/?token={token}")
+        self.assertEqual(extract.status_code, 200)
+
+    def test_wrong_token_is_denied_on_detail(self):
+        document_id, _token = self._upload()
+        response = self.client.get(f"/docs_editor/{document_id}/?token=wrong-token")
+        self.assertEqual(response.status_code, 404)
+        body = response.json()
+        self.assertFalse(body["success"])
+        self.assertEqual(body["error_code"], "NOT_FOUND")
+
+    def test_missing_token_is_denied_on_detail(self):
+        document_id, _token = self._upload()
+        response = self.client.get(f"/docs_editor/{document_id}/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_wrong_token_is_denied_on_extract(self):
+        document_id, _token = self._upload()
+        response = self.client.post(f"/docs_editor/{document_id}/extract/?token=wrong-token")
+        self.assertEqual(response.status_code, 404)
+
+    def test_wrong_token_is_denied_on_save(self):
+        document_id, token = self._upload()
+        self.client.post(f"/docs_editor/{document_id}/extract/?token={token}")
+        response = self.client.post(
+            f"/docs_editor/{document_id}/save/?token=wrong-token",
+            data=json.dumps({"blocks": []}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_wrong_token_is_denied_on_objects_list(self):
+        document_id, _token = self._upload()
+        response = self.client.get(f"/docs_editor/{document_id}/objects/?token=wrong-token")
+        self.assertEqual(response.status_code, 404)
+
+    def test_nonexistent_document_id_returns_identical_response_shape(self):
+        import uuid
+        response = self.client.get(f"/docs_editor/{uuid.uuid4()}/?token=whatever")
+        self.assertEqual(response.status_code, 404)
+        body = response.json()
+        self.assertFalse(body["success"])
+        self.assertEqual(body["error_code"], "NOT_FOUND")
+
+    def test_malformed_document_id_is_handled_safely_not_a_500(self):
+        response = self.client.get("/docs_editor/not-a-valid-uuid/?token=whatever")
+        self.assertEqual(response.status_code, 404)
+
+    def test_raw_media_path_does_not_serve_the_edited_file(self):
+        document_id, token = self._upload()
+        self.client.post(f"/docs_editor/{document_id}/extract/?token={token}")
+        save = self.client.post(
+            f"/docs_editor/{document_id}/save/?token={token}",
+            data=json.dumps({"blocks": []}),
+            content_type="application/json",
+        )
+        # An empty blocks list is invalid per SaveEditedBlocksSerializer,
+        # so add a real one instead to exercise a genuine save.
+        document = Document.objects.get(id=document_id)
+        block = document.blocks.first()
+        save = self.client.post(
+            f"/docs_editor/{document_id}/save/?token={token}",
+            data=json.dumps({"blocks": [{"id": str(block.id), "text": "Edited"}]}),
+            content_type="application/json",
+        )
+        self.assertEqual(save.status_code, 200)
+
+        document.refresh_from_db()
+        response = self.client.get(f"/media/{document.edited_file.name}")
+        self.assertEqual(response.status_code, 404)
+
+        if document.edited_file:
+            document.edited_file.delete(save=False)
+
+
+class DocumentObjectAPITests(TestCase):
+    """CRUD + real-output-verification for editor objects (text/image/
+    shapes/freehand strokes) added on top of the pre-existing text-block
+    editing flow."""
+
+    def _upload_and_extract(self, page_texts=None):
+        pdf = SimpleUploadedFile(
+            "doc.pdf", _make_pdf_bytes(page_texts or ["Original text"]), content_type="application/pdf",
+        )
+        upload = self.client.post("/docs_editor/upload/", {"original_file": pdf})
+        self.assertEqual(upload.status_code, 201)
+        body = upload.json()
+        document_id, token = body["id"], body["owner_token"]
+        self.client.post(f"/docs_editor/{document_id}/extract/?token={token}")
+        return document_id, token
+
+    def test_create_rectangle_object(self):
+        document_id, token = self._upload_and_extract()
+        response = self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {
+                "page_number": 0, "object_type": "rectangle",
+                "bbox": json.dumps([100, 100, 300, 200]),
+                "fill_color": "#00ff00", "stroke_color": "#000000", "stroke_width": 2,
+                "opacity": 0.7, "rotation": 15,
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertEqual(data["object_type"], "rectangle")
+        self.assertEqual(data["bbox"], [100, 100, 300, 200])
+
+    def test_create_text_object_requires_text_content(self):
+        document_id, token = self._upload_and_extract()
+        response = self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {"page_number": 0, "object_type": "text", "bbox": json.dumps([100, 100, 300, 150])},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_create_path_object_requires_points(self):
+        document_id, token = self._upload_and_extract()
+        response = self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {"page_number": 0, "object_type": "path", "points": json.dumps([[1, 2]])},
+        )
+        self.assertEqual(response.status_code, 400)  # only 1 point, need >= 2
+
+    def test_create_image_object_requires_an_image_file(self):
+        document_id, token = self._upload_and_extract()
+        response = self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {"page_number": 0, "object_type": "image", "bbox": json.dumps([100, 100, 200, 160])},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_create_image_object_with_real_image(self):
+        document_id, token = self._upload_and_extract()
+        image = SimpleUploadedFile("photo.png", _make_png_bytes(), content_type="image/png")
+        response = self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {
+                "page_number": 0, "object_type": "image",
+                "bbox": json.dumps([100, 100, 200, 160]),
+                "image": image,
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        image_url = response.json()["image_url"]
+        self.assertTrue(image_url)
+
+        # Real-output verification: the URL DocumentObjectSerializer hands
+        # back must actually be fetchable and return the real image bytes -
+        # not just a truthy string (image_file.url would also be truthy but
+        # 404s, since private_job_storage lives outside MEDIA_ROOT).
+        relative_url = image_url.split("testserver", 1)[-1]
+        fetched = self.client.get(relative_url)
+        self.assertEqual(fetched.status_code, 200)
+        self.assertGreater(len(b"".join(fetched.streaming_content)), 0)
+
+    def test_update_object_via_patch(self):
+        document_id, token = self._upload_and_extract()
+        create = self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {"page_number": 0, "object_type": "rectangle", "bbox": json.dumps([0, 0, 100, 100])},
+        )
+        object_id = create.json()["id"]
+
+        response = self.client.patch(
+            f"/docs_editor/{document_id}/objects/{object_id}/?token={token}",
+            data=json.dumps({"bbox": [10, 10, 110, 110], "rotation": 45}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["bbox"], [10, 10, 110, 110])
+        self.assertEqual(data["rotation"], 45)
+
+    def test_delete_object(self):
+        document_id, token = self._upload_and_extract()
+        create = self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {"page_number": 0, "object_type": "rectangle", "bbox": json.dumps([0, 0, 100, 100])},
+        )
+        object_id = create.json()["id"]
+
+        delete = self.client.delete(f"/docs_editor/{document_id}/objects/{object_id}/?token={token}")
+        self.assertEqual(delete.status_code, 204)
+
+        listing = self.client.get(f"/docs_editor/{document_id}/objects/?token={token}")
+        self.assertEqual(listing.json(), [])
+
+    def test_wrong_token_cannot_create_object(self):
+        document_id, _token = self._upload_and_extract()
+        response = self.client.post(
+            f"/docs_editor/{document_id}/objects/?token=wrong",
+            {"page_number": 0, "object_type": "rectangle", "bbox": json.dumps([0, 0, 100, 100])},
+        )
+        self.assertEqual(response.status_code, 404)
+
+
+class SaveWithObjectsRealOutputTests(TestCase):
+    """
+    Real output verification: adds text/image/shape/freehand objects
+    alongside a text-block edit, saves, then reopens the actual generated
+    PDF with PyMuPDF and asserts every one of them is genuinely present -
+    not just that the API returned 200.
+    """
+
+    def test_save_renders_every_object_type_into_the_real_pdf(self):
+        pdf = SimpleUploadedFile(
+            "doc.pdf", _make_pdf_bytes(["Original heading text"]), content_type="application/pdf",
+        )
+        upload = self.client.post("/docs_editor/upload/", {"original_file": pdf})
+        body = upload.json()
+        document_id, token = body["id"], body["owner_token"]
+
+        extract = self.client.post(f"/docs_editor/{document_id}/extract/?token={token}")
+        block = extract.json()["blocks"][0]
+
+        # One of each object type.
+        self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {
+                "page_number": 0, "object_type": "text",
+                "bbox": json.dumps([72, 150, 400, 190]),
+                "text_content": "Newly added text object", "font_size": 16, "stroke_color": "#0000ff",
+            },
+        )
+        self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {
+                "page_number": 0, "object_type": "rectangle",
+                "bbox": json.dumps([72, 220, 250, 280]),
+                "fill_color": "#00ff00", "stroke_color": "#000000", "stroke_width": 2, "rotation": 12,
+            },
+        )
+        self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {
+                "page_number": 0, "object_type": "path",
+                "points": json.dumps([[72, 400], [100, 380], [130, 410], [160, 370]]),
+                "stroke_color": "#ff00ff", "stroke_width": 3,
+            },
+        )
+        image = SimpleUploadedFile("photo.png", _make_png_bytes(), content_type="image/png")
+        self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {
+                "page_number": 0, "object_type": "image",
+                "bbox": json.dumps([300, 400, 400, 460]),
+                "rotation": 20, "opacity": 0.6,
+                "image": image,
+            },
+        )
+
+        save = self.client.post(
+            f"/docs_editor/{document_id}/save/?token={token}",
+            data=json.dumps({"blocks": [{"id": block["id"], "text": "Edited heading text"}]}),
+            content_type="application/json",
+        )
+        self.assertEqual(save.status_code, 200)
+        download_url = save.json()["download_url"].replace("http://testserver", "")
+
+        download = self.client.get(download_url)
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download["Content-Type"], "application/pdf")
+        downloaded_bytes = b"".join(download.streaming_content)
+
+        result_doc = fitz.open(stream=downloaded_bytes, filetype="pdf")
+        try:
+            full_text = result_doc[0].get_text()
+            self.assertIn("Edited heading text", full_text)
+            self.assertIn("Newly added text object", full_text)
+            self.assertEqual(len(result_doc[0].get_images()), 1)
+            self.assertGreaterEqual(len(result_doc[0].get_drawings()), 2)  # rectangle + path
+        finally:
+            result_doc.close()
+
+        document = Document.objects.get(id=document_id)
+        if document.edited_file:
+            document.edited_file.delete(save=False)
+        for obj in document.editor_objects.all():
+            if obj.image_file:
+                obj.image_file.delete(save=False)
+
+    def test_text_object_too_small_for_its_font_size_still_renders(self):
+        """
+        Regression: PyMuPDF's insert_textbox() returns a negative number -
+        and inserts NOTHING - when text doesn't fit its box at the given
+        font size. object_renderer._draw_text used to ignore that return
+        value, so a text object whose box was too small (e.g. a user drags
+        a small box, then types a long sentence) silently vanished from the
+        saved PDF while the API still reported success. It must now shrink
+        the font until the text fits, mirroring how edited blocks already
+        recover from this in pdf_regenerator._insert_text_safely.
+        """
+        pdf = SimpleUploadedFile("doc.pdf", _make_pdf_bytes(["Original"]), content_type="application/pdf")
+        upload = self.client.post("/docs_editor/upload/", {"original_file": pdf})
+        body = upload.json()
+        document_id, token = body["id"], body["owner_token"]
+        extract = self.client.post(f"/docs_editor/{document_id}/extract/?token={token}")
+        block = extract.json()["blocks"][0]
+
+        # A deliberately small box (160x30) at font size 16 does not fit
+        # this sentence - insert_textbox() returns a negative result for it.
+        self.client.post(
+            f"/docs_editor/{document_id}/objects/?token={token}",
+            {
+                "page_number": 0, "object_type": "text",
+                "bbox": json.dumps([220, 45, 380, 75]),
+                "text_content": "Hello from the object editor", "font_size": 16,
+            },
+        )
+
+        save = self.client.post(
+            f"/docs_editor/{document_id}/save/?token={token}",
+            data=json.dumps({"blocks": [{"id": block["id"], "text": block["text"]}]}),
+            content_type="application/json",
+        )
+        self.assertEqual(save.status_code, 200)
+
+        download_url = save.json()["download_url"].replace("http://testserver", "")
+        download = self.client.get(download_url)
+        downloaded_bytes = b"".join(download.streaming_content)
+        result_doc = fitz.open(stream=downloaded_bytes, filetype="pdf")
+        try:
+            self.assertIn("Hello from the object editor", result_doc[0].get_text())
+        finally:
+            result_doc.close()
+
+        document = Document.objects.get(id=document_id)
+        if document.edited_file:
+            document.edited_file.delete(save=False)
+
+    def test_save_with_no_objects_still_works_as_before(self):
+        """Regression: the pre-existing text-only save flow (no objects
+        at all) must still work exactly as it did before this feature."""
+        pdf = SimpleUploadedFile("doc.pdf", _make_pdf_bytes(["Plain text"]), content_type="application/pdf")
+        upload = self.client.post("/docs_editor/upload/", {"original_file": pdf})
+        body = upload.json()
+        document_id, token = body["id"], body["owner_token"]
+
+        extract = self.client.post(f"/docs_editor/{document_id}/extract/?token={token}")
+        block = extract.json()["blocks"][0]
+
+        save = self.client.post(
+            f"/docs_editor/{document_id}/save/?token={token}",
+            data=json.dumps({"blocks": [{"id": block["id"], "text": "Changed text"}]}),
+            content_type="application/json",
+        )
+        self.assertEqual(save.status_code, 200)
+
+        download_url = save.json()["download_url"].replace("http://testserver", "")
+        download = self.client.get(download_url)
+        downloaded_bytes = b"".join(download.streaming_content)
+        result_doc = fitz.open(stream=downloaded_bytes, filetype="pdf")
+        self.assertIn("Changed text", result_doc[0].get_text())
+        result_doc.close()
+
+        document = Document.objects.get(id=document_id)
+        if document.edited_file:
+            document.edited_file.delete(save=False)
