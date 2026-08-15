@@ -8,7 +8,7 @@ from django.test import TestCase
 from rest_framework import serializers
 
 from .ownership import generate_owner_token, is_owner
-from .validation import validate_pdf_file
+from .validation import validate_image_file, validate_pdf_file
 
 User = get_user_model()
 
@@ -163,3 +163,62 @@ class ValidatePdfFileTests(TestCase):
         pdf = SimpleUploadedFile("doc.pdf", data, content_type="application/pdf")
         with self.assertRaises(serializers.ValidationError):
             validate_pdf_file(pdf, max_pages=3)
+
+
+class ValidateImageFileTests(TestCase):
+    """
+    validate_image_file() is shared by every image-upload feature
+    (currently JPG-to-PDF) - same reasoning as ValidatePdfFileTests.
+    """
+
+    def _make_jpeg(self, name="photo.jpg", size=(100, 80)):
+        from io import BytesIO
+
+        from PIL import Image
+
+        buffer = BytesIO()
+        Image.new("RGB", size, color=(120, 30, 200)).save(buffer, format="JPEG")
+        return SimpleUploadedFile(name, buffer.getvalue(), content_type="image/jpeg")
+
+    def _make_png(self, name="photo.png", size=(100, 80)):
+        from io import BytesIO
+
+        from PIL import Image
+
+        buffer = BytesIO()
+        Image.new("RGB", size, color=(10, 200, 30)).save(buffer, format="PNG")
+        return SimpleUploadedFile(name, buffer.getvalue(), content_type="image/png")
+
+    def test_accepts_a_real_jpeg(self):
+        image = self._make_jpeg(size=(120, 90))
+        width, height = validate_image_file(image)
+        self.assertEqual((width, height), (120, 90))
+
+    def test_accepts_a_real_png(self):
+        image = self._make_png(size=(64, 48))
+        width, height = validate_image_file(image)
+        self.assertEqual((width, height), (64, 48))
+
+    def test_rejects_fake_image_without_real_pixel_data(self):
+        fake = SimpleUploadedFile("fake.jpg", b"just some text pretending to be a jpeg", content_type="image/jpeg")
+        with self.assertRaises(serializers.ValidationError):
+            validate_image_file(fake)
+
+    def test_rejects_non_image_extension(self):
+        image = self._make_jpeg(name="photo.gif")
+        with self.assertRaises(serializers.ValidationError):
+            validate_image_file(image)
+
+    def test_rejects_oversized_image(self):
+        image = self._make_jpeg()
+        with self.assertRaises(serializers.ValidationError):
+            validate_image_file(image, max_size=10)
+
+    def test_rejects_a_pdf_disguised_as_a_jpg(self):
+        doc = fitz.open()
+        doc.new_page()
+        data = doc.tobytes()
+        doc.close()
+        disguised = SimpleUploadedFile("doc.jpg", data, content_type="image/jpeg")
+        with self.assertRaises(serializers.ValidationError):
+            validate_image_file(disguised)

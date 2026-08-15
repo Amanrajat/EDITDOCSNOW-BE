@@ -62,6 +62,13 @@ INSTALLED_APPS = [
     'apps.pdf_split',
     'apps.pdf_organize',
     'apps.pdf_remove_pages',
+    'apps.pdf_rotate',
+    'apps.pdf_crop',
+    'apps.pdf_page_numbers',
+    'apps.pdf_compress',
+    'apps.pdf_batch',
+    'apps.pdf_convert',
+    'apps.pdf_ocr',
 ]
 
 MIDDLEWARE = [
@@ -168,6 +175,25 @@ STORAGES = {
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+
+# Celery — reserved for long-running/high-volume work only (OCR, large
+# conversions, batch processing). Everything else in this codebase is
+# synchronous on purpose. REDIS_URL defaults to a local dev Redis; set it
+# explicitly in production (e.g. Render's Redis/Key Value add-on).
+REDIS_URL = config('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+# Belt-and-suspenders against a worker dying mid-task and losing the job
+# silently - acks_late + a visibility timeout means an unfinished task is
+# redelivered rather than dropped.
+CELERY_TASK_ACKS_LATE = True
+CELERY_BROKER_TRANSPORT_OPTIONS = {'visibility_timeout': 3600}
 
 
 # Default primary key field type

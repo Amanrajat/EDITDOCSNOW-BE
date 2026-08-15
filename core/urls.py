@@ -20,6 +20,13 @@ urlpatterns = [
     path('api/v1/pdf/', include('apps.pdf_split.urls')),
     path('api/v1/pdf/', include('apps.pdf_organize.urls')),
     path('api/v1/pdf/', include('apps.pdf_remove_pages.urls')),
+    path('api/v1/pdf/', include('apps.pdf_rotate.urls')),
+    path('api/v1/pdf/', include('apps.pdf_crop.urls')),
+    path('api/v1/pdf/', include('apps.pdf_page_numbers.urls')),
+    path('api/v1/pdf/', include('apps.pdf_compress.urls')),
+    path('api/v1/pdf/', include('apps.pdf_batch.urls')),
+    path('api/v1/pdf/', include('apps.pdf_convert.urls')),
+    path('api/v1/pdf/', include('apps.pdf_ocr.urls')),
 ]
 
 # Static files are served by whitenoise regardless of DEBUG. Media (uploaded/

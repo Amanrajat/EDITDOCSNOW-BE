@@ -169,6 +169,76 @@ def _insert_text_safely(
     return False
 
 
+def _apply_block_edits(document, blocks):
+    """
+    Redacts and reinserts only the given (already-changed) text blocks
+    onto an already-open document - the exact per-page loop that used to
+    live directly inside regenerate_pdf(), factored out so
+    regenerate_pdf_with_objects() can run it and then render editor
+    objects (see object_renderer.py) onto the SAME open document before a
+    single save, without duplicating this logic.
+    """
+    blocks_by_page = defaultdict(list)
+
+    for block in blocks:
+        blocks_by_page[block.get("page", 0)].append(block)
+
+    for page_number, page_blocks in blocks_by_page.items():
+
+        if page_number < 0 or page_number >= len(document):
+            continue
+
+        page = document[page_number]
+        page_bounds = page.rect
+
+        # Pad each rect slightly so anti-aliased pixels from the
+        # original glyphs at the box edges are fully removed, and
+        # apply every redaction on the page in one pass.
+        padded_rects = []
+
+        for block in page_blocks:
+            rect = fitz.Rect(block["bbox"])
+            rect += (-1, -1, 1, 1)
+            rect &= page_bounds
+
+            padded_rects.append(rect)
+
+            page.add_redact_annot(
+                rect,
+                fill=(1, 1, 1),
+            )
+
+        page.apply_redactions()
+
+        for block, rect in zip(page_blocks, padded_rects):
+
+            new_text = block.get("text", "")
+
+            font_size = float(
+                block.get("size", 12)
+            )
+
+            color = hex_to_rgb(
+                block.get("color", "#000000")
+            )
+
+            font_name, font_file = get_font_spec(block)
+
+            insertion_rect = _widen_rect_to_fit_single_line(
+                rect, page_bounds, new_text, font_size, font_file,
+            )
+
+            _insert_text_safely(
+                page=page,
+                rect=insertion_rect,
+                text=new_text,
+                font_size=font_size,
+                color=color,
+                font_name=font_name,
+                font_file=font_file,
+            )
+
+
 def regenerate_pdf(
     input_path,
     output_path,
@@ -205,65 +275,37 @@ def regenerate_pdf(
     document = fitz.open(input_path)
 
     try:
-        blocks_by_page = defaultdict(list)
+        _apply_block_edits(document, blocks)
 
-        for block in blocks:
-            blocks_by_page[block.get("page", 0)].append(block)
+        document.save(
+            output_path,
+            garbage=4,
+            deflate=True,
+            clean=True,
+        )
 
-        for page_number, page_blocks in blocks_by_page.items():
+    finally:
+        document.close()
 
-            if page_number < 0 or page_number >= len(document):
-                continue
 
-            page = document[page_number]
-            page_bounds = page.rect
+def regenerate_pdf_with_objects(input_path, output_path, blocks, objects, get_image_bytes=None):
+    """
+    Same as regenerate_pdf(), but also renders editor-added objects
+    (text/image/shapes/freehand strokes - see object_renderer.py) onto
+    the same open document before saving, in one pass. `blocks` may be
+    empty (nothing but objects to render) - unlike regenerate_pdf(), an
+    empty `blocks` here does NOT short-circuit to a plain file copy,
+    since there may still be objects to draw.
+    """
+    from . import object_renderer
 
-            # Pad each rect slightly so anti-aliased pixels from the
-            # original glyphs at the box edges are fully removed, and
-            # apply every redaction on the page in one pass.
-            padded_rects = []
+    document = fitz.open(input_path)
 
-            for block in page_blocks:
-                rect = fitz.Rect(block["bbox"])
-                rect += (-1, -1, 1, 1)
-                rect &= page_bounds
-
-                padded_rects.append(rect)
-
-                page.add_redact_annot(
-                    rect,
-                    fill=(1, 1, 1),
-                )
-
-            page.apply_redactions()
-
-            for block, rect in zip(page_blocks, padded_rects):
-
-                new_text = block.get("text", "")
-
-                font_size = float(
-                    block.get("size", 12)
-                )
-
-                color = hex_to_rgb(
-                    block.get("color", "#000000")
-                )
-
-                font_name, font_file = get_font_spec(block)
-
-                insertion_rect = _widen_rect_to_fit_single_line(
-                    rect, page_bounds, new_text, font_size, font_file,
-                )
-
-                _insert_text_safely(
-                    page=page,
-                    rect=insertion_rect,
-                    text=new_text,
-                    font_size=font_size,
-                    color=color,
-                    font_name=font_name,
-                    font_file=font_file,
-                )
+    try:
+        if blocks:
+            _apply_block_edits(document, blocks)
+        if objects:
+            object_renderer.render_objects(document, objects, get_image_bytes=get_image_bytes)
 
         document.save(
             output_path,
