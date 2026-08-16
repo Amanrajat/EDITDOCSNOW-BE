@@ -222,3 +222,17 @@ class ValidateImageFileTests(TestCase):
         disguised = SimpleUploadedFile("doc.jpg", data, content_type="image/jpeg")
         with self.assertRaises(serializers.ValidationError):
             validate_image_file(disguised)
+
+
+class HealthCheckTests(TestCase):
+    """
+    /health/ is what render.yaml's healthCheckPath polls to decide whether
+    to route traffic to an instance at all - it must stay a plain 200
+    regardless of DB/Redis/storage state, so a dependency being down
+    surfaces as that feature failing, not this instance being killed.
+    """
+
+    def test_returns_200_with_ok_status(self):
+        response = self.client.get("/health/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
