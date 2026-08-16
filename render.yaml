@@ -15,7 +15,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: free
-    healthCheckPath: /docs_editor/
+    healthCheckPath: /health/
     envVars:
       - key: SECRET_KEY
         generateValue: true

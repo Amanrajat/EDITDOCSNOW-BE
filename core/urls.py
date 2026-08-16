@@ -6,8 +6,12 @@ from django.urls import path, include, re_path
 from django.conf import settings
 from django.views.static import serve as serve_static
 
+from apps.common.views import health_check
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+
+    path('health/', health_check, name='health-check'),
 
     path(
         'docs_editor/',

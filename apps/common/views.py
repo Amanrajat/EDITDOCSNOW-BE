@@ -1,9 +1,24 @@
 from django.core.exceptions import ValidationError
-from django.http import FileResponse
+from django.http import FileResponse, JsonResponse
 from rest_framework.views import APIView
 
 from .ownership import is_owner
 from .responses import error_response
+
+
+def health_check(request):
+    """
+    GET /health/
+
+    Deliberately dependency-free (no DB/Redis/storage checks) - this is
+    what a platform's healthcheck (e.g. Render's `healthCheckPath`) polls
+    to decide whether to route traffic to this instance at all, so it
+    must stay fast and cheap regardless of the state of anything else the
+    app depends on. A slow or down dependency should surface as a failure
+    of the specific feature that needs it, not as this instance being
+    killed/recycled.
+    """
+    return JsonResponse({"status": "ok"})
 
 
 class OwnedJobDownloadView(APIView):
