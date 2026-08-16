@@ -5,6 +5,11 @@ databases:
     user: editdocsnow
 
 services:
+  - type: redis
+    name: editdocsnow-redis
+    plan: free
+    ipAllowList: []
+
   - type: web
     name: editdocsnow-be
     runtime: docker
@@ -24,6 +29,11 @@ services:
         fromDatabase:
           name: editdocsnow-db
           property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: editdocsnow-redis
+          property: connectionString
     # Persistent disks require a paid instance type (not available on the
     # free plan). Uncomment once you upgrade the plan above, otherwise
     # uploaded/generated PDFs are lost on every deploy and restart.
@@ -31,3 +41,36 @@ services:
     #   name: editdocsnow-media
     #   mountPath: /app/media
     #   sizeGB: 1
+
+  # Runs Batch Processing and OCR's Celery tasks. Deliberately a SEPARATE
+  # service from `web` (Render's worker service type has no HTTP port/
+  # healthcheck), which means it does NOT share a filesystem with `web` -
+  # neither service has a persistent disk on the free plan anyway. Any
+  # job whose task still relies on reading a file `web` saved to local
+  # disk (job.source_file, job.file, ...) will simply not find it here.
+  # OCR's task (apps.pdf_ocr.tasks.run_ocr_job) already avoids this by
+  # carrying the source PDF's bytes through the Celery message itself
+  # instead of relying on shared disk - see apps/pdf_ocr/services.py's
+  # process_job(). Batch Processing's task does not yet have the same
+  # fix and will hit the same failure mode this worker was created to
+  # solve for OCR.
+  - type: worker
+    name: editdocsnow-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: celery -A core worker --loglevel=info --concurrency=2
+    plan: free
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: editdocsnow-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: editdocsnow-redis
+          property: connectionString

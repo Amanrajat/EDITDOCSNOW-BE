@@ -1,3 +1,5 @@
+import base64
+
 from django.core.exceptions import ValidationError
 from django.http import FileResponse
 from django.urls import reverse
@@ -35,9 +37,18 @@ class OcrSubmitView(APIView):
             )
 
         data = serializer.validated_data
+        uploaded_file = data["file"]
         user = request.user if request.user.is_authenticated else None
-        job = create_job(user=user, uploaded_file=data["file"], language=data["language"])
-        run_ocr_job.delay(str(job.id))
+        job = create_job(user=user, uploaded_file=uploaded_file, language=data["language"])
+
+        # Pass the file bytes through the Celery message itself, not just
+        # the job id - the worker may not share a filesystem with this web
+        # process (e.g. separate Render services with no shared/persistent
+        # disk), in which case job.source_file would simply not exist for
+        # it to read. See tasks.run_ocr_job / services.process_job.
+        uploaded_file.seek(0)
+        source_bytes_b64 = base64.b64encode(uploaded_file.read()).decode("ascii")
+        run_ocr_job.delay(str(job.id), source_bytes_b64)
 
         status_path = reverse("pdf_ocr:ocr-status", args=[job.id])
         status_url = request.build_absolute_uri(f"{status_path}?token={job.owner_token}")
