@@ -6,19 +6,62 @@ from .ownership import is_owner
 from .responses import error_response
 
 
+def _check_database():
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT 1")
+
+
+def _check_redis():
+    import redis
+    from django.conf import settings
+
+    client = redis.from_url(settings.REDIS_URL, socket_connect_timeout=2, socket_timeout=2)
+    try:
+        client.ping()
+    finally:
+        client.close()
+
+
 def health_check(request):
     """
     GET /health/
 
-    Deliberately dependency-free (no DB/Redis/storage checks) - this is
-    what a platform's healthcheck (e.g. Render's `healthCheckPath`) polls
-    to decide whether to route traffic to this instance at all, so it
-    must stay fast and cheap regardless of the state of anything else the
-    app depends on. A slow or down dependency should surface as a failure
-    of the specific feature that needs it, not as this instance being
-    killed/recycled.
+    Plain liveness check by default: no DB/Redis/storage access, just a
+    fast 200. This is what a platform's healthcheck (e.g. Render's
+    `healthCheckPath`) polls to decide whether to route traffic to this
+    instance at all, so it must stay cheap regardless of the state of
+    anything else the app depends on - a slow or down dependency should
+    surface as a failure of the specific feature that needs it, not as
+    this instance being killed/recycled.
+
+    GET /health/?deep=true
+
+    Opt-in dependency check for manual/diagnostic use (not meant to be
+    the platform's automated probe - a broker or DB hiccup here should
+    not by itself get a healthy web instance recycled). Actually
+    connects to Postgres and Redis and reports per-dependency status.
+    Returns 200 if every checked dependency is reachable, 503 otherwise.
     """
-    return JsonResponse({"status": "ok"})
+    if request.GET.get("deep") != "true":
+        return JsonResponse({"status": "ok"})
+
+    checks = {}
+    all_ok = True
+
+    for name, check in (("database", _check_database), ("redis", _check_redis)):
+        try:
+            check()
+            checks[name] = "ok"
+        except Exception as exc:
+            checks[name] = f"error: {exc}"
+            all_ok = False
+
+    return JsonResponse(
+        {"status": "ok" if all_ok else "degraded", "checks": checks},
+        status=200 if all_ok else 503,
+    )
 
 
 class OwnedJobDownloadView(APIView):

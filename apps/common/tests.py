@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import fitz
 from django.contrib.auth import get_user_model
@@ -230,9 +231,47 @@ class HealthCheckTests(TestCase):
     to route traffic to an instance at all - it must stay a plain 200
     regardless of DB/Redis/storage state, so a dependency being down
     surfaces as that feature failing, not this instance being killed.
+    /health/?deep=true is the separate, opt-in diagnostic variant that
+    actually contacts Postgres and Redis.
     """
 
     def test_returns_200_with_ok_status(self):
         response = self.client.get("/health/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_deep_check_does_not_touch_redis_or_db_by_default(self):
+        """The plain /health/ path must never import/contact redis at all -
+        proven by patching it to always raise, which would fail this test
+        if health_check's fast path accidentally called it."""
+        with patch("apps.common.views._check_redis", side_effect=AssertionError("must not be called")):
+            response = self.client.get("/health/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_deep_check_reports_ok_when_dependencies_are_reachable(self):
+        with patch("apps.common.views._check_redis", return_value=None):
+            response = self.client.get("/health/?deep=true")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["checks"]["database"], "ok")
+        self.assertEqual(body["checks"]["redis"], "ok")
+
+    def test_deep_check_reports_degraded_when_redis_is_unreachable(self):
+        with patch("apps.common.views._check_redis", side_effect=ConnectionError("Connection refused")):
+            response = self.client.get("/health/?deep=true")
+        self.assertEqual(response.status_code, 503)
+        body = response.json()
+        self.assertEqual(body["status"], "degraded")
+        self.assertEqual(body["checks"]["database"], "ok")
+        self.assertIn("Connection refused", body["checks"]["redis"])
+
+    def test_deep_check_reports_degraded_when_database_is_unreachable(self):
+        with patch("apps.common.views._check_database", side_effect=Exception("no such database")):
+            with patch("apps.common.views._check_redis", return_value=None):
+                response = self.client.get("/health/?deep=true")
+        self.assertEqual(response.status_code, 503)
+        body = response.json()
+        self.assertEqual(body["status"], "degraded")
+        self.assertIn("no such database", body["checks"]["database"])
+        self.assertEqual(body["checks"]["redis"], "ok")
