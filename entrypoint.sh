@@ -10,7 +10,7 @@
 #     --timeout 120
 
 
-#!/bin/sh
+!/bin/sh
 set -e
 
 python manage.py migrate --noinput
