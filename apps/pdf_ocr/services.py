@@ -9,6 +9,7 @@ page that already has real text alone rather than re-OCRing or
 duplicating it.
 """
 
+import base64
 import os
 import shutil
 import tempfile
@@ -165,10 +166,21 @@ def create_job(user, uploaded_file, language):
     return job
 
 
-def process_job(job_id):
+def process_job(job_id, source_bytes_b64=None):
     """Runs the actual OCR for one job - called from the Celery task, but
     is plain sync code so it's directly unit-testable with
-    CELERY_TASK_ALWAYS_EAGER, same as apps.pdf_batch.services.process_file."""
+    CELERY_TASK_ALWAYS_EAGER, same as apps.pdf_batch.services.process_file.
+
+    `source_bytes_b64`: when provided (the real Celery dispatch path - see
+    tasks.py), the source PDF is decoded straight from the task message and
+    job.source_file is never read from disk at all. This is required
+    whenever the worker doesn't share a filesystem with whichever process
+    saved job.source_file (e.g. web and worker as separate services with no
+    shared/persistent disk) - reading it back locally would raise
+    FileNotFoundError there every time. When omitted (existing direct
+    process_job(job_id) callers - unit tests, single-process local dev),
+    falls back to reading job.source_file, which works fine there since
+    storage is genuinely shared with whatever process wrote it."""
     try:
         job = OcrJob.objects.get(id=job_id)
     except OcrJob.DoesNotExist:
@@ -181,7 +193,10 @@ def process_job(job_id):
     job.save(update_fields=["status"])
 
     try:
-        source_bytes = job.source_file.read()
+        if source_bytes_b64 is not None:
+            source_bytes = base64.b64decode(source_bytes_b64)
+        else:
+            source_bytes = job.source_file.read()
         output_bytes, metadata = run_ocr(source_bytes, language=job.language)
 
         job.page_count = metadata["page_count"]

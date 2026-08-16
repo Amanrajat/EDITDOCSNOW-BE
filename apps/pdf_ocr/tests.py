@@ -1,3 +1,4 @@
+import base64
 import shutil
 import unittest
 
@@ -137,6 +138,39 @@ class RunOcrServiceTests(TestCase):
         self.assertTrue(job.output_file.name)
         self.assertFalse(job.source_file)  # cleaned up
         self.assertIsNotNone(job.completed_at)
+
+        job.output_file.delete(save=False)
+
+    def test_process_job_completes_even_when_source_file_is_unreadable_on_this_worker(self):
+        """
+        Regression: a Celery worker that doesn't share a filesystem with
+        whichever process saved job.source_file (e.g. web and worker as
+        separate Render services with no shared/persistent disk) can never
+        read that file back - job.source_file.read() would raise
+        FileNotFoundError there every time, which used to mean OCR could
+        never complete outside a single-process setup. process_job must
+        use source_bytes_b64 (passed through the Celery message itself,
+        see tasks.run_ocr_job) instead of ever touching job.source_file
+        when it's given. Proven here by deleting the on-disk file before
+        calling process_job and confirming OCR still completes using only
+        the bytes passed in.
+        """
+        source_bytes = _make_scanned_pdf("NOSHAREDDISK")
+        pdf = SimpleUploadedFile("doc.pdf", source_bytes, content_type="application/pdf")
+        job = create_job(user=None, uploaded_file=pdf, language="eng")
+
+        # Simulate "the worker can't see this file" by removing it from
+        # disk entirely - job.source_file.read() would now raise.
+        job.source_file.delete(save=False)
+
+        process_job(str(job.id), source_bytes_b64=base64.b64encode(source_bytes).decode("ascii"))
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, OcrJob.Status.COMPLETED)
+        doc = fitz.open(stream=job.output_file.read(), filetype="pdf")
+        extracted = doc[0].get_text().upper().replace(" ", "")
+        doc.close()
+        self.assertIn("NOSHAREDDISK", extracted)
 
         job.output_file.delete(save=False)
 
